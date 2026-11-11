@@ -1,10 +1,11 @@
 import json
 import os
+import re
 import subprocess
+from pathlib import Path
 
 from dotenv import load_dotenv
 from openai import OpenAI
-from pathlib import Path
 
 # 命令行输入体验的兼容处理
 try:
@@ -30,16 +31,21 @@ ENVIRONMENT_PROMPT = (
     "Windows: the bash tool runs through cmd.exe; use cmd.exe syntax, not Unix "
     "Bash or PowerShell syntax"
     if os.name == "nt"
-    else "Unix-like: the bash tool runs the system shell"
+    else "Unix-like: the shell tool runs the system shell"
 )
 
 INSTRUCTIONS = (
-    f"You are a coding agent at {os.getcwd()}. Environment: {ENVIRONMENT_PROMPT}. "
-    "Give priority to using file tools and use shell when necessary. Act, don't explain."
+    f"You are a coding agent at {WORKDIR}. Environment: {ENVIRONMENT_PROMPT}. "
+    "Use tools to solve tasks. Do not ask for approval yourself. "
+    "For destructive operations, still request the tool call; "
+    "the harness will approve or deny before execution."
 )
 
 
 # -- Tool definition --
+        lines = (WORKDIR / path).resolve().read_text(encoding="utf-8").splitlines()
+        file_path = (WORKDIR / path).resolve()
+        file_path = (WORKDIR / path).resolve()
 TOOLS = [
     {
         "type": "function",
@@ -110,9 +116,9 @@ TOOLS = [
 
 # -- New in s02: tool definitions (one tool in s01, five in s02) --
 
+# -- New in s03: three-gate permission pipeline --
 
 def run_shell(command: str) -> str:
-    dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
     if any(d in command for d in dangerous):
         return "Error: Dangerous command blocked"
     try:
@@ -132,16 +138,22 @@ def run_shell(command: str) -> str:
         return "Error: Timeout(120s)"
     except (FileNotFoundError, OSError) as e:
         return f"Error: {e}"
+# Gate 1: Hard deny list - always forbidden
+DENY_LIST = ["rm -rf /", "sudo", "shutdown", "reboot", "mkfs", "dd if=", "> /dev/sda"]
 
 
 # -- New in s02: four tools --
+def check_deny_list(command: str) -> str | None:
+    for pattern in DENY_LIST:
+        if pattern in command:
+            return f"Blocked: '{pattern}' is on the deny list"
+    return None
 
 
-def safe_path(p: str) -> Path:
-    path = (WORKDIR / p).resolve()
-    if not path.is_relative_to(WORKDIR):
-        raise ValueError(f"Path escapes workspace: {p}")
-    return path
+# Gate 2: Rule matching - context-dependent checks
+DESTRUCTIVE_COMMAND_WORD = re.compile(
+    r"(?i)(?:^|[;&|()\n])\s*(?:rm|del)(?=\s|$|[;&|()])"
+)
 
 
 # - 读取文件，按需截取返回内容 -
@@ -153,6 +165,8 @@ def run_read(path: str, limit: int | None = None) -> str:
         return "\n".join(lines)
     except Exception as e:
         return f"Error: {e}"
+def contains_destructive_command(command: str) -> bool:
+    return bool(DESTRUCTIVE_COMMAND_WORD.search(command))
 
 
 def run_write(path: str, content: str) -> str:
@@ -163,6 +177,25 @@ def run_write(path: str, content: str) -> str:
         return f"Wrote {len(content)} bytes to {path}"
     except Exception as e:
         return f"Error: {e}"
+PERMISSION_RULES = [
+    {
+        "tools": ["read_file", "write_file", "edit_file"],
+        "check": lambda args: (
+            not (WORKDIR / args.get("path", "")).resolve().is_relative_to(WORKDIR)
+        ),
+        "message": "Access outside workspace",
+    },
+    {
+        "tools": ["shell"],
+        "check": lambda args: (
+            contains_destructive_command(args.get("command", ""))
+            or any(
+                kw in args.get("command", "") for kw in ["rm", "> /etc/", "chmod 777"]
+            )
+        ),
+        "message": "Potentially destructive command",
+    },
+]
 
 
 def run_edit(path: str, old_text: str, new_text: str) -> str:
@@ -175,10 +208,21 @@ def run_edit(path: str, old_text: str, new_text: str) -> str:
         return f"Edited {path}"
     except Exception as e:
         return f"Error: {e}"
+def check_rules(tool_name: str, args: dict) -> str | None:
+    for rule in PERMISSION_RULES:
+        if tool_name in rule["tools"] and rule["check"](args):
+            return rule["message"]
+    return None
 
 
 def run_glob(pattern: str) -> str:
     import glob as g
+# Gate 3: User approval - wait for comfirmation after rule match
+def ask_user(tool_name: str, args: dict, reason: str) -> str:
+    print(f"\n⚠️   {reason}")
+    print(f"    Tool: {tool_name} - {args}")
+    choice = input("   Allow? [y/N]").strip().lower()
+    return "allow" if choice in ("y", "yes") else "deny"
 
     try:
         matchs = sorted(
@@ -195,8 +239,23 @@ def run_glob(pattern: str) -> str:
     except Exception as e:
         return f"Error: {e}"
 
+# Pipeline: all three gate chained
+def check_permission(block) -> bool:
+    tool_name = block.name
+    arguments = json.loads(block.arguments)
+    if tool_name == "shell":
+        reason = check_deny_list(arguments.get("command", ""))
+        if reason:
+            print(f"\n⛔️ {reason}")
+            return False
+    reason = check_rules(tool_name, arguments)
+    if reason:
+        decision = ask_user(tool_name, arguments, reason)
+        if decision == "deny":
+            return False
 
 # -- New in s02: dispatch map (replaces s01's hard-coded run_bash call) --
+    return True
 
 TOOL_HANDLES = {
     "shell": run_shell,
@@ -205,10 +264,11 @@ TOOL_HANDLES = {
     "edit_file": run_edit,
     "glob": run_glob,
 }
+# -- Agent Loop: same as s02, with check_permission() inserted --
 
 
 def agent_loop(inputs: list):
-    for _ in range(3):
+    for _ in range(5):
         response = cilent.responses.create(
             model=MODEL,
             instructions=INSTRUCTIONS,
@@ -230,6 +290,17 @@ def agent_loop(inputs: list):
         # Excute tools and return results
         results = []
         for block in tool_calls:
+            # New in s03: run through permission pipeline before excuting
+            if not check_permission(block):
+                results.append(
+                    {
+                        "type": "function_call_output",
+                        "call_id": block.call_id,
+                        "output": "Permission denied.",
+                    }
+                )
+                continue
+
             handler = TOOL_HANDLES.get(block.name)
             arguments: dict = json.loads(block.arguments)  # like {"command": "ls -la"}
 
@@ -237,7 +308,7 @@ def agent_loop(inputs: list):
                 handler(**arguments) if handler else f"Unknown handler: {block.name}"
             )
 
-            print(str(output[:200]))
+            print(f"Tool {block.name}'s output: {str(output)[:200]}")
 
             results.append(
                 {
